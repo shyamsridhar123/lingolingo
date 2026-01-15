@@ -1,9 +1,4 @@
 name: Mayor West Orchestrator
-# Autonomous task assignment and PR merge workflow
-# Triggers:
-# - Immediately when mayor-task issue is created/labeled
-# - When PR is opened (to merge Copilot PRs)
-# - When PR is closed (to pick up next task)
 
 on:
   workflow_dispatch:
@@ -54,13 +49,12 @@ jobs:
         if: steps.find_task.outputs.found == 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_AW_AGENT_TOKEN || secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_AW_AGENT_TOKEN }}
           script: |
             const taskNumber = ${{ steps.find_task.outputs.task_number }};
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             
-            // Step 1: Find Copilot agent ID using suggestedActors query
             console.log('Looking for copilot coding agent...');
             const findAgentQuery = `
               query($owner: String!, $repo: String!) {
@@ -84,20 +78,17 @@ jobs:
             
             if (!copilotAgent) {
               console.log('Available actors:', actors.map(a => a.login).join(', '));
-              throw new Error('Copilot coding agent (copilot-swe-agent) is not available for this repository');
+              throw new Error('Copilot coding agent not available');
             }
             
-            console.log(`Found copilot agent with ID: ${copilotAgent.id}`);
+            console.log(`Found copilot agent: ${copilotAgent.id}`);
             
-            // Step 2: Get issue ID and current assignees
             const issueQuery = `
               query($owner: String!, $repo: String!, $issueNumber: Int!) {
                 repository(owner: $owner, name: $repo) {
                   issue(number: $issueNumber) {
                     id
-                    assignees(first: 100) {
-                      nodes { id }
-                    }
+                    assignees(first: 100) { nodes { id } }
                   }
                 }
               }
@@ -107,9 +98,6 @@ jobs:
             const issueId = issueResponse.repository.issue.id;
             const currentAssignees = issueResponse.repository.issue.assignees.nodes.map(a => a.id);
             
-            console.log(`Issue ID: ${issueId}`);
-            
-            // Step 3: Assign Copilot using replaceActorsForAssignable mutation
             const actorIds = [copilotAgent.id, ...currentAssignees.filter(id => id !== copilotAgent.id)];
             
             const assignMutation = `
@@ -117,143 +105,15 @@ jobs:
                 replaceActorsForAssignable(input: {
                   assignableId: $assignableId,
                   actorIds: $actorIds
-                }) {
-                  __typename
-                }
+                }) { __typename }
               }
             `;
             
             await github.graphql(assignMutation, { assignableId: issueId, actorIds });
-            console.log(`Successfully assigned Copilot to issue #${taskNumber}`);
-            
-            // Step 4: Add comment with instructions for Copilot
-            const commentBody = [
-              'ðŸ¤– **@copilot-swe-agent** assigned to this task.',
-              '',
-              '**Before starting, read:**',
-              '- `.github/copilot/instructions.md` - Your operating protocol',
-              '- `.github/copilot-instructions.md` - Project rules',
-              '',
-              '**Key requirements:**',
-              '1. Run `npm test` before committing',
-              '2. Use commit format: `[MAYOR] <description>`',
-              `3. Include \`Fixes #${taskNumber}\` in PR body`,
-              '4. Never use destructive commands',
-              '',
-              'Good luck, Mayor West! ðŸŽ©'
-            ].join('\n');
+            console.log(`Assigned Copilot to issue #${taskNumber}`);
             
             await github.rest.issues.createComment({
-              owner,
-              repo,
+              owner, repo,
               issue_number: taskNumber,
-              body: commentBody
+              body: `**@copilot-swe-agent** assigned. Read \`.github/copilot/instructions.md\` before starting.`
             });
-            console.log(`Added instructions comment to issue #${taskNumber}`);
-
-  # Job 2: Merge ready Copilot PRs (bypasses workflow approval requirement)
-  merge-copilot-prs:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Find and Merge Copilot PRs
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GH_AW_AGENT_TOKEN || secrets.GITHUB_TOKEN }}
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            
-            // Find open PRs from Copilot
-            const { data: prs } = await github.rest.pulls.list({
-              owner,
-              repo,
-              state: 'open',
-              sort: 'created',
-              direction: 'asc'
-            });
-            
-            console.log(`Found ${prs.length} open PRs`);
-            
-            // Filter for Copilot PRs - check various login formats
-            const copilotPRs = prs.filter(pr => {
-              const login = pr.user.login.toLowerCase();
-              const isCopilot = login === 'copilot' || 
-                                login === 'copilot-swe-agent' ||
-                                login.includes('copilot');
-              if (isCopilot) {
-                console.log(`  Found Copilot PR #${pr.number} by ${pr.user.login}`);
-              }
-              return isCopilot;
-            });
-            
-            if (copilotPRs.length === 0) {
-              console.log('No open Copilot PRs found');
-              return;
-            }
-            
-            for (const pr of copilotPRs) {
-              console.log(`Processing PR #${pr.number}: ${pr.title}`);
-              
-              // If PR is draft, mark it as ready first
-              if (pr.draft) {
-                console.log(`  PR is a draft, marking as ready...`);
-                try {
-                  await github.graphql(`
-                    mutation($prId: ID!) {
-                      markPullRequestReadyForReview(input: { pullRequestId: $prId }) {
-                        pullRequest { isDraft }
-                      }
-                    }
-                  `, { prId: pr.node_id });
-                  console.log(`  âœ… Marked as ready for review`);
-                } catch (error) {
-                  console.log(`  âš ï¸ Could not mark ready: ${error.message}`);
-                  continue;
-                }
-              }
-              
-              // Check if PR is mergeable
-              const { data: prDetails } = await github.rest.pulls.get({
-                owner,
-                repo,
-                pull_number: pr.number
-              });
-              
-              if (prDetails.mergeable_state === 'dirty') {
-                console.log(`  Skipping: PR has merge conflicts`);
-                continue;
-              }
-              
-              if (prDetails.mergeable_state === 'blocked') {
-                console.log(`  Skipping: PR is blocked (status checks pending)`);
-                continue;
-              }
-              
-              // Approve the PR first
-              try {
-                await github.rest.pulls.createReview({
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  event: 'APPROVE',
-                  body: 'âœ… Auto-approved by Mayor West Orchestrator'
-                });
-                console.log(`  âœ… Approved PR #${pr.number}`);
-              } catch (error) {
-                console.log(`  âš ï¸ Could not approve: ${error.message}`);
-              }
-              
-              // Merge the PR
-              try {
-                await github.rest.pulls.merge({
-                  owner,
-                  repo,
-                  pull_number: pr.number,
-                  merge_method: 'squash'
-                });
-                console.log(`  âœ… Merged PR #${pr.number}`);
-              } catch (error) {
-                console.log(`  âš ï¸ Could not merge: ${error.message}`);
-              }
-            }
